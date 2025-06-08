@@ -1,5 +1,3 @@
-# README.md
-"""Documentation for Mercado Livre Analytics Platform."""
 # Mercado Livre Analytics Platform
 ## Comprehensive ETL Pipeline & Business Intelligence for Noneca.com
 
@@ -541,5 +539,7 @@ python -m src.services.etl_orchestrator --seller 354140329 --full-pipeline
 
 ---
 
-This enhanced platform now delivers a complete marketplace intelligence solution with dual ETL capabilities, providing both product catalog analytics and transaction intelligence. The robust foundation supports advanced business intelligence, predictive analytics, and strategic decision-making for competitive advantage in the Brazilian e-commerce market.#   n o n e c a _ c o m _ v 2  
+This enhanced platform now delivers a complete marketplace intelligence solution with dual ETL capabilities, providing both product catalog analytics and transaction intelligence. The robust foundation supports advanced business intelligence, predictive analytics, and strategic decision-making for competitive advantage in the Brazilian e-commerce market.#   n o n e c a _ c o m _ v 2 
+ 
+ #   n o n e c a _ c o m _ v 2  
  

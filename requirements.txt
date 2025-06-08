@@ -1,0 +1,15 @@
+python-dotenv
+rich
+requests
+flask
+dash
+plotly
+pandas
+setuptools
+certifi
+sqlalchemy
+pytest
+tqdm
+paste
+psutil
+tenacity
