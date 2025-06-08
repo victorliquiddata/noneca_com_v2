@@ -49,9 +49,9 @@ Comprehensive ETL Pipeline & Business Intelligence for **Noneca.com**
 ```mermaid
 flowchart TD
     CLI[Command Line Interface] <--> ProductETL[Product ETL Pipeline]
-    ProductETL --> DB1[SQLite (Products)]
+    ProductETL --> DB1[SQLite Products]
     OrdersCLI[Orders CLI] <--> OrdersETL[Orders ETL Pipeline]
-    OrdersETL --> DB2[SQLite (Orders)]
+    OrdersETL --> DB2[SQLite Orders]
     ProductETL <--> API1[Mercado Livre Items API]
     OrdersETL <--> API2[Mercado Livre Orders API]
 ```
