@@ -34,10 +34,10 @@ Comprehensive ETL Pipeline & Business Intelligence for **Noneca.com**
 ## Key Features
 
 * **Dual ETL Pipelines**: Separate workflows for products and orders
-* **Interactive CLI**: Flexible extraction strategies (last 100, 500, 5000 orders)
+* **Interactive CLI**: Single extraction strategy for items and main Business analytics, Flexible extraction strategies for orders (last 100, 500, 5000, all available), all of them via offset pagination 
 * **OAuth 2.0**: Secure ML API integration with token management
 * **Automated Enrichment**: Conversion rates, discounts, and sales metrics
-* **Comprehensive Testing**: 84/84 tests passing with pytest
+* **Comprehensive Testing**: 99 tests passing with pytest (1 skippped due to API upstream deficiency)
 
 ---
 
@@ -79,10 +79,19 @@ flowchart TD
    Create a `.env` file:
 
    ```ini
-   ML_CLIENT_ID=your_client_id
-   ML_CLIENT_SECRET=your_client_secret
-   ACCESS_TOKEN=your_fallback_token
-   REFRESH_TOKEN=your_refresh_token
+    # MercadoLibre API Configuration
+    ML_CLIENT_ID=your_id
+    ML_CLIENT_SECRET=your_secret
+    ML_REDIRECT_URI=your_uri
+
+    # API Configuration
+    API_TIMEOUT=30
+    RATE_LIMIT=100
+
+    # Fallback Tokens
+    ACCESS_TOKEN=your_token
+    REFRESH_TOKEN=your_refresh
+    TOKEN_EXPIRES=your_token_exp
    ```
 4. **Run ETL**
 

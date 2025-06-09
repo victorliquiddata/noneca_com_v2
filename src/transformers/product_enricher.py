@@ -45,6 +45,7 @@ def enrich_item(item: Dict[str, Any]) -> Dict[str, Any]:
         return {}
 
     attrs = item.get("attributes", [])
+    seller_info = item.get("seller", {})  # Extract the full seller object
 
     # Extract attributes - note the correct attribute key for color
     brand = _get_attr(attrs, "BRAND")
@@ -79,6 +80,8 @@ def enrich_item(item: Dict[str, Any]) -> Dict[str, Any]:
         "views": views,
         "conversion_rate": conversion,
         "seller_id": item.get("seller_id"),
+        # Add seller_nickname for relational Seller table
+        "seller_nickname": seller_info.get("nickname"),
         "created_at": timestamp,
         "updated_at": timestamp,
         "discount_percentage": discount_pct,

@@ -2,136 +2,576 @@
 # --- .\main.py
 #!/usr/bin/env python3
 # main.py
-"""Main script to run the product ETL pipeline."""
 """
-Main ETL pipeline orchestrator for Noneca.com Mercado Livre Analytics Platform.
-Extracts product data, enriches it, and loads into database.
+
+Improved Main ETL pipeline orchestrator for Noneca.com Mercado Livre Analytics Platform.
+Extracts product data and order data, enriches both, and loads into database.
+
+🚀 Usage Examples
+Basic Usage (Multi-seller mode):
+
+python main.py
+
+Single seller with config file:
+
+python main.py config.json
+
+Single seller, specific pipeline:
+
+python main.py 354140329 items    # Items only
+
+python main.py 354140329 orders   # Orders only
+
+python main.py 354140329 full     # Both pipelines
+
 """
 
 import sys
 import logging
-from typing import List, Dict, Optional
+import os
+import json
+from typing import List, Dict, Optional, Any
+from datetime import datetime, timedelta
+from pathlib import Path
+from dataclasses import dataclass, asdict
 
 from src.extractors.items_extractor import extract_items_with_enrichments
+from src.extractors.orders_extractor import extract_orders
 from src.transformers.product_enricher import enrich_items
-from src.loaders.data_loader import load_items_to_db
-
-# Configure minimal logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler()],
-)
-logger = logging.getLogger(__name__)
+from src.transformers.order_enricher import enrich_orders
+from src.loaders.data_loader import load_items_to_db, load_orders_to_db
+from src.extractors.ml_api_client import create_client
 
 
-def run_etl_pipeline(
-    seller_id: str,
-    limit: int = 50,
-    include_descriptions: bool = True,
-    include_reviews: bool = False,
-    db_url: str = "sqlite:///./data/noneca_analytics.db",
-) -> bool:
-    """
-    Execute complete ETL pipeline for a single seller.
+@dataclass
+class PipelineConfig:
+    """Configuration class for ETL pipeline."""
 
-    Returns:
-        True if pipeline completed successfully, False otherwise
-    """
-    logger.info(f"Starting ETL pipeline for seller {seller_id}")
+    # Database settings
+    db_url: str = "sqlite:///./data/noneca_analytics.db"
+    backup_db_url: str = "sqlite:///./data/noneca_analytics_backup.db"
 
-    # Extract
-    logger.info("Extracting items...")
-    raw_items = extract_items_with_enrichments(
-        seller_id=seller_id,
-        limit=limit,
-        include_descriptions=include_descriptions,
-        include_reviews=include_reviews,
-    )
+    # API limits (respecting Mercado Libre API constraints)
+    max_items_per_seller: Optional[int] = None  # None = all available
+    max_orders_per_seller: Optional[int] = None  # None = all available
+    api_pagination_limit: int = 50  # Max 50 per API call
 
-    if not raw_items:
-        logger.warning(f"No items extracted for seller {seller_id}")
-        return False
+    # Orders date range (None = API default range, typically ~1 year)
+    orders_date_from: Optional[str] = None
+    orders_date_to: Optional[str] = None
 
-    logger.info(f"Extracted {len(raw_items)} items")
+    # Items enrichment options
+    include_descriptions: bool = True
+    include_reviews: bool = False
 
-    # Transform
-    logger.info("Enriching items...")
-    enriched_items = enrich_items(raw_items)
+    # Default sellers for multi-seller runs
+    default_sellers: List[str] = None
 
-    if not enriched_items:
-        logger.error("Enrichment failed - no items to load")
-        return False
+    # Logging configuration
+    log_level: str = "INFO"
+    log_to_file: bool = True
+    log_file: str = "pipeline.log"
 
-    logger.info(f"Enriched {len(enriched_items)} items")
+    def __post_init__(self):
+        """Initialize default values after dataclass creation."""
+        if self.default_sellers is None:
+            self.default_sellers = [
+                "354140329",  # Replace with actual seller IDs
+            ]
 
-    # Load
-    logger.info("Loading items to database...")
-    try:
-        load_items_to_db(enriched_items, db_url)
-        logger.info("ETL pipeline completed successfully")
-        return True
-    except Exception as e:
-        logger.error(f"Loading failed: {e}")
-        return False
+        # Leave dates as None to use API's default range (typically 1 year)
+        # Comment out the date setting logic to use API defaults
+
+        # To go back to stipulating a date range:
+        # Simply uncomment those lines (change days=30 to days=365 for 1 year)
+        # Don't comment anything else
+
+        # if self.orders_date_from is None:
+        #     self.orders_date_from = (datetime.now() - timedelta(days=365)).strftime(
+        #         "%Y-%m-%dT00:00:00.000Z"
+        #     )
+        # if self.orders_date_to is None:
+        #     self.orders_date_to = datetime.now().strftime("%Y-%m-%dT23:59:59.999Z")
+
+        # Update log file path to include subfolder
+        self.log_file = f"pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+    def save_to_file(self, filepath: str = None):
+        """Save configuration to JSON file in organized structure."""
+        if filepath is None:
+            # Create config directory and use default path
+            os.makedirs("config", exist_ok=True)
+            filepath = "config/pipeline_configs.json"
+
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+        with open(filepath, "w") as f:
+            json.dump(asdict(self), f, indent=2, default=str)
+
+    @classmethod
+    def load_from_file(cls, filepath: str) -> "PipelineConfig":
+        """Load configuration from JSON file."""
+        with open(filepath, "r") as f:
+            data = json.load(f)
+        return cls(**data)
 
 
-def run_multi_seller_pipeline(
-    seller_ids: List[str],
-    limit: int = 50,
-    db_url: str = "sqlite:///./data/noneca_analytics.db",
-) -> Dict[str, bool]:
-    """
-    Execute ETL pipeline for multiple sellers.
+class ImprovedPipelineLogger:
+    """Enhanced logging setup for the pipeline."""
 
-    Returns:
-        Dictionary mapping seller_id to success status
-    """
-    results = {}
+    def __init__(self, config: PipelineConfig):
+        self.config = config
+        self.logger = self._setup_logger()
 
-    for seller_id in seller_ids:
+    def _setup_logger(self) -> logging.Logger:
+        """Setup comprehensive logging with file and console handlers."""
+        logger = logging.getLogger("pipeline")
+        logger.setLevel(getattr(logging, self.config.log_level.upper()))
+
+        # Clear existing handlers
+        logger.handlers.clear()
+
+        # Create formatters
+        detailed_formatter = logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+
+        simple_formatter = logging.Formatter(
+            "%(asctime)s - %(levelname)s - %(message)s", datefmt="%H:%M:%S"
+        )
+
+        # Console handler
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(simple_formatter)
+        console_handler.setLevel(logging.INFO)
+        logger.addHandler(console_handler)
+
+        # File handler (if enabled) - organized in subfolder
+        if self.config.log_to_file:
+            # Create organized log directory structure
+            log_dir = "logs/pipeline_logs"
+            os.makedirs(log_dir, exist_ok=True)
+
+            log_file_path = os.path.join(log_dir, self.config.log_file)
+            file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
+            file_handler.setFormatter(detailed_formatter)
+            file_handler.setLevel(logging.DEBUG)
+            logger.addHandler(file_handler)
+
+        return logger
+
+    def get_logger(self) -> logging.Logger:
+        """Get the configured logger instance."""
+        return self.logger
+
+
+class PipelineResults:
+    """Track and manage pipeline execution results."""
+
+    def __init__(self):
+        self.start_time = datetime.now()
+        self.end_time = None
+        self.results = {}
+        self.errors = []
+        self.warnings = []
+
+    def add_seller_result(
+        self,
+        seller_id: str,
+        pipeline_type: str,
+        success: bool,
+        records_processed: int = 0,
+        error_msg: str = None,
+    ):
+        """Add result for a specific seller and pipeline type."""
+        if seller_id not in self.results:
+            self.results[seller_id] = {}
+
+        self.results[seller_id][pipeline_type] = {
+            "success": success,
+            "records_processed": records_processed,
+            "error": error_msg,
+        }
+
+        if error_msg:
+            self.errors.append(f"{seller_id} ({pipeline_type}): {error_msg}")
+
+    def add_warning(self, message: str):
+        """Add a warning message."""
+        self.warnings.append(message)
+
+    def finalize(self):
+        """Finalize results and calculate summary statistics."""
+        self.end_time = datetime.now()
+        self.duration = (self.end_time - self.start_time).total_seconds()
+
+    def get_summary(self) -> Dict[str, Any]:
+        """Get summary statistics."""
+        if not self.end_time:
+            self.finalize()
+
+        total_sellers = len(self.results)
+        items_successful = sum(
+            1 for r in self.results.values() if r.get("items", {}).get("success", False)
+        )
+        orders_successful = sum(
+            1
+            for r in self.results.values()
+            if r.get("orders", {}).get("success", False)
+        )
+        fully_successful = sum(
+            1
+            for r in self.results.values()
+            if all(pipeline.get("success", False) for pipeline in r.values())
+        )
+
+        return {
+            "duration": self.duration,
+            "total_sellers": total_sellers,
+            "items_successful": items_successful,
+            "orders_successful": orders_successful,
+            "fully_successful": fully_successful,
+            "total_errors": len(self.errors),
+            "total_warnings": len(self.warnings),
+        }
+
+    def save_to_file(self, filepath: str = None):
+        """Save results to JSON file in organized structure."""
+        if filepath is None:
+            # Create organized results directory and use timestamped filename
+            results_dir = "logs/pipeline_results"
+            os.makedirs(results_dir, exist_ok=True)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filepath = os.path.join(results_dir, f"pipeline_results_{timestamp}.json")
+        else:
+            # Ensure directory exists for custom filepath
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+        data = {
+            "start_time": self.start_time.isoformat(),
+            "end_time": self.end_time.isoformat() if self.end_time else None,
+            "duration": getattr(self, "duration", None),
+            "results": self.results,
+            "errors": self.errors,
+            "warnings": self.warnings,
+            "summary": self.get_summary(),
+        }
+
+        with open(filepath, "w") as f:
+            json.dump(data, f, indent=2, default=str)
+
+
+class ImprovedETLPipeline:
+    """Enhanced ETL Pipeline with robust error handling and configuration."""
+
+    def __init__(self, config: PipelineConfig):
+        self.config = config
+        self.logger_setup = ImprovedPipelineLogger(config)
+        self.logger = self.logger_setup.get_logger()
+        self.results = PipelineResults()
+
+    def validate_environment(self) -> bool:
+        """Validate environment and API connectivity."""
+        self.logger.info("Validating environment and API connectivity...")
+
         try:
-            success = run_etl_pipeline(seller_id=seller_id, limit=limit, db_url=db_url)
-            results[seller_id] = success
-        except Exception as e:
-            logger.error(f"Pipeline failed for seller {seller_id}: {e}")
-            results[seller_id] = False
+            # Create data directory
+            os.makedirs("./data", exist_ok=True)
 
-    return results
+            # Test API connection
+            client, token = create_client()
+            user_info = client.get_user(token)
+            self.logger.info(
+                f"✓ API connection successful. User: {user_info.get('nickname', 'Unknown')}"
+            )
+
+            # Validate seller IDs
+            for seller_id in self.config.default_sellers:
+                try:
+                    # Quick test to validate seller exists
+                    test_items = client.get_items(token, seller_id, limit=1)
+                    self.logger.info(
+                        f"✓ Seller {seller_id} validated ({len(test_items)} items available)"
+                    )
+                except Exception as e:
+                    self.logger.warning(f"⚠ Seller {seller_id} validation failed: {e}")
+                    self.results.add_warning(
+                        f"Seller {seller_id} validation failed: {e}"
+                    )
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"❌ Environment validation failed: {e}")
+            return False
+
+    def run_items_pipeline(self, seller_id: str) -> bool:
+        """Execute items ETL pipeline for a single seller with enhanced error handling."""
+        self.logger.info(f"Starting ITEMS pipeline for seller {seller_id}")
+
+        try:
+            # Extract with enrichments
+            self.logger.info("Extracting items with enrichments...")
+            raw_items = extract_items_with_enrichments(
+                seller_id=seller_id,
+                limit=self.config.max_items_per_seller,
+                include_descriptions=self.config.include_descriptions,
+                include_reviews=self.config.include_reviews,
+            )
+
+            if not raw_items:
+                self.logger.warning(f"No items extracted for seller {seller_id}")
+                self.results.add_seller_result(
+                    seller_id, "items", False, 0, "No items found"
+                )
+                return False
+
+            self.logger.info(f"✓ Extracted {len(raw_items)} items")
+
+            # Transform
+            self.logger.info("Enriching items...")
+            enriched_items = enrich_items(raw_items)
+
+            if not enriched_items:
+                error_msg = "Items enrichment failed - no items to load"
+                self.logger.error(error_msg)
+                self.results.add_seller_result(seller_id, "items", False, 0, error_msg)
+                return False
+
+            self.logger.info(f"✓ Enriched {len(enriched_items)} items")
+
+            # Load
+            self.logger.info("Loading items to database...")
+            load_items_to_db(enriched_items, self.config.db_url)
+
+            self.logger.info(
+                f"✅ Items pipeline completed successfully for seller {seller_id}"
+            )
+            self.results.add_seller_result(
+                seller_id, "items", True, len(enriched_items)
+            )
+            return True
+
+        except Exception as e:
+            error_msg = f"Items pipeline failed: {e}"
+            self.logger.error(f"❌ {error_msg}")
+            self.results.add_seller_result(seller_id, "items", False, 0, str(e))
+            return False
+
+    def run_orders_pipeline(self, seller_id: str) -> bool:
+        """Execute orders ETL pipeline for a single seller with enhanced error handling."""
+        self.logger.info(f"Starting ORDERS pipeline for seller {seller_id}")
+
+        try:
+            self.logger.info(
+                f"Date range: {self.config.orders_date_from} to {self.config.orders_date_to}"
+            )
+
+            # Extract with proper pagination limit
+            self.logger.info("Extracting orders...")
+            raw_orders = extract_orders(
+                seller_id=seller_id,
+                date_from=self.config.orders_date_from,
+                date_to=self.config.orders_date_to,
+                limit=self.config.api_pagination_limit,  # Respect API limit
+                max_records=self.config.max_orders_per_seller,
+            )
+
+            if not raw_orders:
+                self.logger.warning(f"No orders extracted for seller {seller_id}")
+                self.results.add_seller_result(
+                    seller_id, "orders", False, 0, "No orders found"
+                )
+                return False
+
+            self.logger.info(f"✓ Extracted {len(raw_orders)} orders")
+
+            # Transform
+            self.logger.info("Enriching orders...")
+            enriched_orders = enrich_orders(raw_orders)
+
+            if not enriched_orders:
+                error_msg = "Orders enrichment failed - no orders to load"
+                self.logger.error(error_msg)
+                self.results.add_seller_result(seller_id, "orders", False, 0, error_msg)
+                return False
+
+            self.logger.info(f"✓ Enriched {len(enriched_orders)} orders")
+
+            # Load
+            self.logger.info("Loading orders to database...")
+            load_orders_to_db(enriched_orders, self.config.db_url)
+
+            self.logger.info(
+                f"✅ Orders pipeline completed successfully for seller {seller_id}"
+            )
+            self.results.add_seller_result(
+                seller_id, "orders", True, len(enriched_orders)
+            )
+            return True
+
+        except Exception as e:
+            error_msg = f"Orders pipeline failed: {e}"
+            self.logger.error(f"❌ {error_msg}")
+            self.results.add_seller_result(seller_id, "orders", False, 0, str(e))
+            return False
+
+    def run_full_pipeline(self, seller_id: str) -> Dict[str, bool]:
+        """Execute both items and orders pipelines for a single seller."""
+        self.logger.info(f"🚀 Starting FULL pipeline for seller {seller_id}")
+
+        items_success = self.run_items_pipeline(seller_id)
+        orders_success = self.run_orders_pipeline(seller_id)
+
+        return {"items": items_success, "orders": orders_success}
+
+    def run_multi_seller_pipeline(
+        self, seller_ids: Optional[List[str]] = None
+    ) -> Dict[str, Dict[str, bool]]:
+        """Execute full pipeline for multiple sellers with comprehensive reporting."""
+        if seller_ids is None:
+            seller_ids = self.config.default_sellers
+
+        self.logger.info(
+            f"🎯 Starting MULTI-SELLER pipeline for {len(seller_ids)} sellers"
+        )
+
+        for i, seller_id in enumerate(seller_ids, 1):
+            self.logger.info(f"📍 Processing seller {i}/{len(seller_ids)}: {seller_id}")
+            try:
+                self.run_full_pipeline(seller_id)
+            except Exception as e:
+                self.logger.error(f"❌ Critical failure for seller {seller_id}: {e}")
+                self.results.add_seller_result(
+                    seller_id, "items", False, 0, f"Critical failure: {e}"
+                )
+                self.results.add_seller_result(
+                    seller_id, "orders", False, 0, f"Critical failure: {e}"
+                )
+
+        return self.results.results
+
+    def generate_final_report(self):
+        """Generate comprehensive final report."""
+        self.results.finalize()
+        summary = self.results.get_summary()
+
+        self.logger.info("=" * 60)
+        self.logger.info("📊 PIPELINE EXECUTION REPORT")
+        self.logger.info("=" * 60)
+
+        self.logger.info(f"⏱️  Total Duration: {summary['duration']:.2f} seconds")
+        self.logger.info(f"🏪 Total Sellers: {summary['total_sellers']}")
+        self.logger.info(
+            f"📦 Items Successful: {summary['items_successful']}/{summary['total_sellers']}"
+        )
+        self.logger.info(
+            f"🛒 Orders Successful: {summary['orders_successful']}/{summary['total_sellers']}"
+        )
+        self.logger.info(
+            f"✅ Fully Successful: {summary['fully_successful']}/{summary['total_sellers']}"
+        )
+
+        if summary["total_errors"] > 0:
+            self.logger.info(f"❌ Total Errors: {summary['total_errors']}")
+            for error in self.results.errors:
+                self.logger.error(f"   • {error}")
+
+        if summary["total_warnings"] > 0:
+            self.logger.info(f"⚠️  Total Warnings: {summary['total_warnings']}")
+            for warning in self.results.warnings:
+                self.logger.warning(f"   • {warning}")
+
+        # Save detailed results with organized path
+        self.results.save_to_file()  # Uses default organized path now
+
+        # Get the actual filepath for logging
+        results_dir = "logs/pipeline_results"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        results_file = f"pipeline_results_{timestamp}.json"
+        self.logger.info(f"📄 Detailed results saved to: {results_dir}/{results_file}")
+
+        # Overall status
+        if (
+            summary["fully_successful"] == summary["total_sellers"]
+            and summary["total_errors"] == 0
+        ):
+            self.logger.info("🎉 PIPELINE EXECUTION: SUCCESS")
+            return True
+        else:
+            self.logger.info("💥 PIPELINE EXECUTION: PARTIAL SUCCESS OR FAILURE")
+            return False
+
+    def save_current_config(self):
+        """Save current pipeline configuration for future reference."""
+        self.config.save_to_file()  # Uses default organized path
+        self.logger.info(
+            "💾 Pipeline configuration saved to: config/pipeline_configs.json"
+        )
+
+
+def load_config_from_args() -> PipelineConfig:
+    """Load configuration from command line arguments or config file."""
+    config = PipelineConfig()
+
+    # Check for config file argument
+    if len(sys.argv) > 1 and sys.argv[1].endswith(".json"):
+        try:
+            config = PipelineConfig.load_from_file(sys.argv[1])
+            print(f"✓ Loaded configuration from {sys.argv[1]}")
+        except Exception as e:
+            print(f"⚠ Failed to load config file {sys.argv[1]}: {e}")
+            print("Using default configuration...")
+
+    return config
 
 
 def main():
-    """Main entry point - run ETL pipeline with default configuration."""
+    """Enhanced main entry point with robust configuration and error handling."""
+    print("🚀 Noneca.com Mercado Livre Analytics Pipeline")
+    print("=" * 50)
 
-    # Default seller IDs for intimate apparel market analysis
-    # These would typically come from config or command line args
-    default_sellers = [
-        "354140329",  # Example seller ID - replace with actual sellers
-        # "987654321",  # Example seller ID - replace with actual sellers
-    ]
+    # Load configuration
+    config = load_config_from_args()
 
-    # Check for command line seller ID argument
-    seller_id = sys.argv[1] if len(sys.argv) > 1 else None
+    # Initialize pipeline
+    pipeline = ImprovedETLPipeline(config)
 
-    if seller_id:
-        # Single seller mode
-        logger.info(f"Running ETL for single seller: {seller_id}")
-        success = run_etl_pipeline(seller_id, limit=100)
+    # Validate environment
+    if not pipeline.validate_environment():
+        print("❌ Environment validation failed. Exiting.")
+        sys.exit(1)
+
+    # Parse command line arguments for specific operations
+    if len(sys.argv) > 1 and not sys.argv[1].endswith(".json"):
+        seller_id = sys.argv[1]
+        pipeline_type = sys.argv[2] if len(sys.argv) > 2 else "full"
+
+        pipeline.logger.info(
+            f"🎯 Running {pipeline_type.upper()} pipeline for seller: {seller_id}"
+        )
+
+        if pipeline_type == "items":
+            success = pipeline.run_items_pipeline(seller_id)
+        elif pipeline_type == "orders":
+            success = pipeline.run_orders_pipeline(seller_id)
+        else:  # "full" or any other value
+            results = pipeline.run_full_pipeline(seller_id)
+            success = all(results.values())
+
+        pipeline.generate_final_report()
         sys.exit(0 if success else 1)
 
-    # Multi-seller mode
-    logger.info("Running ETL for multiple sellers")
-    results = run_multi_seller_pipeline(default_sellers, limit=50)
+    # Multi-seller mode (default)
+    pipeline.logger.info("🏪 Multi-seller mode: Processing all configured sellers")
+    pipeline.run_multi_seller_pipeline()
 
-    # Report results
-    successful = sum(results.values())
-    total = len(results)
-    logger.info(
-        f"Pipeline completed: {successful}/{total} sellers processed successfully"
-    )
-
-    # Exit with error code if any pipeline failed
-    sys.exit(0 if successful == total else 1)
+    # Generate final report and exit
+    success = pipeline.generate_final_report()
+    sys.exit(0 if success else 1)
 
 
 if __name__ == "__main__":
@@ -174,7 +614,7 @@ cfg = Config()
 # --- .\src\extractors\items_extractor.py
 #!/usr/bin/env python3
 # src/extractors/items_extractor.py
-"""Extractor for fetching product catalog data."""
+"""Extractor for fetching product catalog data with pagination support."""
 import logging
 from typing import List, Dict, Optional
 from src.extractors.ml_api_client import create_client
@@ -182,13 +622,13 @@ from src.extractors.ml_api_client import create_client
 logger = logging.getLogger(__name__)
 
 
-def extract_items(seller_id: str, limit: int = 50) -> List[Dict]:
+def extract_items(seller_id: str, limit: Optional[int] = None) -> List[Dict]:
     """
-    Extract items for a given seller using the ML API client.
+    Extract items for a given seller using the ML API client with pagination.
 
     Args:
         seller_id: The seller ID to extract items for
-        limit: Maximum number of items to extract (default: 50)
+        limit: Maximum number of items to extract (None for all items, default: None)
 
     Returns:
         List of item dictionaries, or empty list if extraction fails
@@ -197,12 +637,21 @@ def extract_items(seller_id: str, limit: int = 50) -> List[Dict]:
         logger.error("Seller ID is required")
         return []
 
-    if limit <= 0:
-        logger.error("Limit must be positive")
+    if limit is not None and limit <= 0:
+        logger.error("Limit must be positive or None")
         return []
 
     try:
         client, token = create_client()
+
+        # Log the extraction attempt
+        if limit is None:
+            logger.info(f"Starting extraction of ALL items for seller {seller_id}")
+        else:
+            logger.info(
+                f"Starting extraction of up to {limit} items for seller {seller_id}"
+            )
+
         items = client.get_items(token, seller_id, limit=limit)
 
         if not items:
@@ -254,7 +703,7 @@ def extract_item_details(item_id: str, token: Optional[str] = None) -> Optional[
 
 def extract_items_with_enrichments(
     seller_id: str,
-    limit: int = 50,
+    limit: Optional[int] = None,
     include_descriptions: bool = True,
     include_reviews: bool = False,
 ) -> List[Dict]:
@@ -263,7 +712,7 @@ def extract_items_with_enrichments(
 
     Args:
         seller_id: The seller ID to extract items for
-        limit: Maximum number of items to extract
+        limit: Maximum number of items to extract (None for all items)
         include_descriptions: Whether to include item descriptions
         include_reviews: Whether to include review data
 
@@ -281,8 +730,10 @@ def extract_items_with_enrichments(
         if not items:
             return []
 
+        logger.info(f"Starting enrichment of {len(items)} items for seller {seller_id}")
         enriched_items = []
-        for item in items:
+
+        for i, item in enumerate(items, 1):
             item_id = item.get("id")
             if not item_id:
                 enriched_items.append(item)
@@ -307,6 +758,10 @@ def extract_items_with_enrichments(
 
             enriched_items.append(enriched_item)
 
+            # Log progress every 25 items
+            if i % 25 == 0:
+                logger.info(f"Enriched {i}/{len(items)} items for seller {seller_id}")
+
         logger.info(
             f"Successfully enriched {len(enriched_items)} items for seller {seller_id}"
         )
@@ -319,10 +774,12 @@ def extract_items_with_enrichments(
 # --- .\src\extractors\ml_api_client.py
 #!/usr/bin/env python3
 # src/extractors/ml_api_client.py
-"""Mercado Livre API client with OAuth 2.0 integration."""
+"""Mercado Livre API client with OAuth 2.0 integration and pagination support."""
 import os
 import json
 import requests
+import typing
+from typing import Dict, Any, Optional
 import secrets
 from datetime import datetime, timedelta
 from config.config import cfg
@@ -384,11 +841,69 @@ class MLClient:
         params = {"attributes": attrs} if attrs else {}
         return self._req("GET", f"/users/{user_id}", params=params)
 
-    def get_items(self, token, seller_id, limit=50, status="active"):
+    def get_items(self, token, seller_id, limit=None, status="active"):
+        """
+        Extract items for a seller with pagination support.
+
+        Args:
+            token: Authentication token
+            seller_id: The seller ID to extract items for
+            limit: Maximum number of items to extract (None for all items)
+            status: Item status filter (default: "active")
+
+        Returns:
+            List of item dictionaries with full details
+        """
         self._auth(token)
-        params = {"limit": limit, "status": status}
-        result = self._req("GET", f"/users/{seller_id}/items/search", params=params)
-        return [self.get_item(token, item_id) for item_id in result.get("results", [])]
+
+        collected_items = []
+        offset = 0
+        page_size = 100  # Maximum items per API request
+
+        while True:
+            # Calculate how many items to request this round
+            if limit is not None:
+                remaining = limit - len(collected_items)
+                if remaining <= 0:
+                    break
+                current_limit = min(page_size, remaining)
+            else:
+                current_limit = page_size
+
+            params = {"limit": current_limit, "offset": offset, "status": status}
+
+            try:
+                result = self._req(
+                    "GET", f"/users/{seller_id}/items/search", params=params
+                )
+                batch_ids = result.get("results", [])
+
+                if not batch_ids:
+                    break  # No more items
+
+                # Fetch full item details for this batch
+                batch_items = []
+                for item_id in batch_ids:
+                    try:
+                        item_details = self.get_item(token, item_id)
+                        if item_details:
+                            batch_items.append(item_details)
+                    except Exception as e:
+                        print(f"Warning: Failed to get details for item {item_id}: {e}")
+                        continue
+
+                collected_items.extend(batch_items)
+                offset += len(batch_ids)
+
+                # Stop if we got fewer items than requested (end of data)
+                if len(batch_ids) < current_limit:
+                    break
+
+            except Exception as e:
+                print(f"Error fetching items batch at offset {offset}: {e}")
+                break
+
+        return collected_items[:limit] if limit else collected_items
 
     def get_item(self, token, item_id, attrs=None):
         self._auth(token)
@@ -422,10 +937,42 @@ class MLClient:
         except Exception as e:
             return {"questions": [], "total": 0, "error": str(e)}
 
-    def get_orders(self, token, seller_id, limit=50):
+    def get_orders(
+        self,
+        token: str,
+        seller_id: str,
+        *,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        sort: str = "date_created",
+        limit: int = 100,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        """
+        Hits /orders/search with full filter/sort/pagination support.
+        Returns the raw JSON (including `results`, `paging`, etc.) for callers to
+        page through as needed.
+        """
+        # Ensure we have a valid bearer token on the session
         self._auth(token)
-        params = {"seller": seller_id, "limit": limit}
-        return self._req("GET", "/orders/search", params=params)["results"]
+
+        # Build query parameters
+        params: Dict[str, Any] = {
+            "seller": seller_id,
+            "limit": limit,
+            "offset": offset,
+            "sort": "date_asc" if sort == "date_created" else sort,
+        }
+        if date_from:
+            params["order.date_created.from"] = date_from
+        if date_to:
+            params["order.date_created.to"] = date_to
+
+        # Delegate to the shared request method
+        response = self._req("GET", "/orders/search", params=params)
+
+        # response is expected to include both "results" and "paging"
+        return response
 
     def get_listing_types(self, token, site_id):
         self._auth(token)
@@ -461,15 +1008,15 @@ class MLClient:
         try:
             return self._req("GET", f"/sites/{site_id}/search", params=params)
         except Exception as e:
-            # If it fails with 403 or 401, fall back to “items by seller” if we can
+            # If it fails with 403 or 401, fall back to "items by seller" if we can
             msg = str(e).lower()
             if "403" in msg or "401" in msg:
                 # If caller already passed seller_id, just re‐raise (nothing else to try)
                 if seller_id:
                     raise
 
-                # Otherwise, fetch the user’s own ID and do /users/{id}/items/search
-                user = self.get_user(token)  # returns JSON with “id” field
+                # Otherwise, fetch the user's own ID and do /users/{id}/items/search
+                user = self.get_user(token)  # returns JSON with "id" field
                 fallback_seller = user["id"]
                 return self.get_items(token, fallback_seller, limit=limit)
             # For any other exception, re‐raise
@@ -574,6 +1121,94 @@ def get_token():
 def create_client():
     return MLClient(), get_token()
 
+# --- .\src\extractors\orders_extractor.py
+#!/usr/bin/env python3
+# src/extractors/orders_extractor.py
+
+import logging
+from typing import List, Optional, Dict, Any
+
+from src.extractors.ml_api_client import create_client, MLClient
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
+
+
+def extract_orders(
+    seller_id: str,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    sort: str = "date_created",
+    limit: int = 100,
+    max_records: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Extracts orders for a given seller from the ML API using pagination.
+
+    Args:
+        seller_id: The seller identifier as a string.
+        date_from: ISO-8601 date string for starting filter (inclusive).
+        date_to: ISO-8601 date string for ending filter (inclusive).
+        sort: Field to sort by (e.g., 'date_created').
+        limit: Page size (number of records to fetch per call).
+        max_records: Optional cap on total records to retrieve.
+
+    Returns:
+        A list of raw order dictionaries as returned by the API.
+    """
+    client, token = create_client()
+    all_orders: List[Dict[str, Any]] = []
+    offset = 0
+
+    logger.info(
+        "Starting extraction of orders for seller_id=%s from %s to %s",
+        seller_id,
+        date_from,
+        date_to,
+    )
+
+    while True:
+        # Fetch one “page” of orders
+        page = client.get_orders(
+            token,
+            seller_id,
+            date_from=date_from,
+            date_to=date_to,
+            sort=sort,
+            limit=limit,
+            offset=offset,
+        )
+
+        batch = page.get("results", [])
+        if not batch:
+            logger.debug("No more orders returned at offset %d", offset)
+            break
+
+        all_orders.extend(batch)
+        logger.info(
+            "Fetched %d orders (offset %d – total so far %d)",
+            len(batch),
+            offset,
+            len(all_orders),
+        )
+
+        # Honor max_records if provided
+        if max_records and len(all_orders) >= max_records:
+            all_orders = all_orders[:max_records]
+            logger.info("Reached max_records limit of %d", max_records)
+            break
+
+        # Advance offset for next page
+        # Use returned paging info if available, else fall back to offset + limit
+        paging = page.get("paging", {})
+        offset = paging.get("offset", offset) + paging.get("limit", limit)
+
+    logger.info("Completed extraction: total orders fetched = %d", len(all_orders))
+    return all_orders
+
+
+__all__ = ["extract_orders"]
+
 # --- .\src\loaders\data_loader.py
 # src/loaders/data_loader.py
 """Generic loader for persisting product data to database."""
@@ -581,8 +1216,12 @@ def create_client():
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.exc import SQLAlchemyError
+import logging
 
 from src.models.models import Item, PriceHistory, Seller, create_all_tables
+from src.models.models import Order, Buyer, OrderItem  # Add to the imports
+
+logger = logging.getLogger(__name__)
 
 
 def load_items_to_db(enriched_items, db_url="sqlite:///./data/noneca_analytics.db"):
@@ -591,6 +1230,7 @@ def load_items_to_db(enriched_items, db_url="sqlite:///./data/noneca_analytics.d
     If seller info is embedded, upsert into `sellers` as well.
     """
     if not enriched_items:
+        logger.info("No items to load")
         return
 
     engine = create_engine(db_url, echo=False, future=True)
@@ -663,15 +1303,171 @@ def load_items_to_db(enriched_items, db_url="sqlite:///./data/noneca_analytics.d
             session.add(PriceHistory(**price_record))
 
         session.commit()
-    except SQLAlchemyError:
+        logger.info(f"Successfully loaded {len(enriched_items)} items to database")
+    except SQLAlchemyError as e:
         session.rollback()
+        logger.error(f"Failed to load items to database: {e}")
+        raise
+    finally:
+        session.close()
+
+
+def load_orders_to_db(enriched_orders, db_url="sqlite:///./data/noneca_analytics.db"):
+    """
+    Upsert enriched order data into Buyers, Sellers, Orders, and OrderItems tables.
+
+    FIXED: Properly handle dictionary data and create ORM instances instead of
+    passing raw dictionaries to SQLAlchemy operations.
+    """
+    if not enriched_orders:
+        logger.info("No orders to load")
+        return
+
+    engine = create_engine(db_url, echo=False, future=True)
+    Session = sessionmaker(bind=engine)
+    create_all_tables(engine)
+
+    session = Session()
+    try:
+        orders_loaded = 0
+        buyers_loaded = 0
+        sellers_loaded = 0
+        order_items_loaded = 0
+
+        for record in enriched_orders:
+            try:
+                # --- Upsert Buyer ---
+                buyer_id = record.get("buyer_id")
+                if buyer_id:
+                    existing_buyer = session.get(Buyer, buyer_id)
+                    if existing_buyer:
+                        if record.get("buyer_nickname"):
+                            existing_buyer.nickname = record["buyer_nickname"]
+                    else:
+                        # Create new Buyer instance properly
+                        new_buyer = Buyer(
+                            buyer_id=buyer_id, nickname=record.get("buyer_nickname")
+                        )
+                        session.add(new_buyer)
+                        buyers_loaded += 1
+
+                # --- Upsert Seller ---
+                seller_id = record.get("seller_id")
+                seller_nickname = record.get("seller_nickname")
+                if seller_id:
+                    existing_seller = session.get(Seller, seller_id)
+                    if existing_seller:
+                        if seller_nickname:
+                            existing_seller.nickname = seller_nickname
+                    else:
+                        # Create new Seller instance properly
+                        new_seller = Seller(
+                            seller_id=seller_id, nickname=seller_nickname
+                        )
+                        session.add(new_seller)
+                        sellers_loaded += 1
+
+                # --- Upsert Order ---
+                order_id = record.get("order_id")
+                if not order_id:
+                    logger.warning(f"Skipping order with missing order_id: {record}")
+                    continue
+
+                existing_order = session.get(Order, order_id)
+                if existing_order:
+                    # Update existing order fields
+                    for field in (
+                        "status",
+                        "total_amount",
+                        "total_fees",
+                        "profit_margin",
+                        "currency_id",
+                        "seller_id",
+                        "buyer_id",
+                        "date_created",
+                        "date_closed",
+                    ):
+                        if field in record and record[field] is not None:
+                            setattr(existing_order, field, record[field])
+                else:
+                    # Create new Order instance with only valid fields
+                    order_fields = {}
+                    for field in (
+                        "order_id",
+                        "status",
+                        "total_amount",
+                        "total_fees",
+                        "profit_margin",
+                        "currency_id",
+                        "seller_id",
+                        "buyer_id",
+                        "date_created",
+                        "date_closed",
+                    ):
+                        if field in record and record[field] is not None:
+                            order_fields[field] = record[field]
+
+                    # Create the Order instance properly
+                    new_order = Order(**order_fields)
+                    session.add(new_order)
+                    orders_loaded += 1
+
+                # --- Insert OrderItems ---
+                items = record.get("items", [])
+                for item_data in items:
+                    # Only create OrderItem if we have required fields
+                    if item_data.get("item_id"):
+                        order_item_fields = {}
+                        for field in (
+                            "order_id",
+                            "item_id",
+                            "quantity",
+                            "unit_price",
+                            "sale_fee",
+                            "listing_type",
+                            "variation_id",
+                        ):
+                            if field == "order_id":
+                                order_item_fields[field] = order_id
+                            elif field in item_data and item_data[field] is not None:
+                                order_item_fields[field] = item_data[field]
+
+                        # Create OrderItem instance properly
+                        new_order_item = OrderItem(**order_item_fields)
+                        session.add(new_order_item)
+                        order_items_loaded += 1
+
+            except Exception as e:
+                logger.error(
+                    f"Error processing order {record.get('order_id', 'unknown')}: {e}"
+                )
+                continue
+
+        # Commit all changes
+        session.commit()
+        logger.info(f"Successfully loaded to database:")
+        logger.info(f"  - Orders: {orders_loaded}")
+        logger.info(f"  - Buyers: {buyers_loaded}")
+        logger.info(f"  - Sellers: {sellers_loaded}")
+        logger.info(f"  - Order Items: {order_items_loaded}")
+
+    except SQLAlchemyError as e:
+        session.rollback()
+        logger.error(f"Database error during order loading: {e}")
+        raise
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Unexpected error during order loading: {e}")
         raise
     finally:
         session.close()
 
 # --- .\src\models\models.py
 # models/models.py
-"""SQLAlchemy models for products and sellers."""
+"""
+SQLAlchemy models for products, sellers, and transactional order data,
+designed with a star schema approach for business intelligence analytics.
+"""
 from sqlalchemy import (
     Column,
     String,
@@ -682,8 +1478,9 @@ from sqlalchemy import (
     DateTime,
     func,
     text,
+    ForeignKey,
 )
-from sqlalchemy.orm import declarative_base
+from sqlalchemy.orm import declarative_base, relationship
 
 Base = declarative_base()
 
@@ -693,24 +1490,31 @@ class Item(Base):
 
     item_id = Column(String(50), primary_key=True)
     title = Column(String(500))
-    category_id = Column(String(50))
+    category_id = Column(String(50), index=True)
     current_price = Column(Float(precision=2))
     original_price = Column(Float(precision=2))
     available_quantity = Column(Integer)
     sold_quantity = Column(Integer)
     condition = Column(String(20))
-    brand = Column(String(100))
+    brand = Column(String(100), index=True)
     size = Column(String(20))
     color = Column(String(50))
     gender = Column(String(20))
     views = Column(Integer, default=0)
     conversion_rate = Column(Float(precision=4))
-    seller_id = Column(Integer)
+    seller_id = Column(Integer, ForeignKey("sellers.seller_id"), index=True)
     created_at = Column(DateTime, server_default=text("CURRENT_TIMESTAMP"))
     updated_at = Column(
         DateTime,
-        default=func.current_timestamp(),  # pylint: disable=E1102
-        onupdate=func.current_timestamp(),  # pylint: disable=E1102
+        server_default=text("CURRENT_TIMESTAMP"),
+        onupdate=func.current_timestamp,
+    )
+
+    # Relationships to link to other tables
+    seller = relationship("Seller", back_populates="items")
+    order_items = relationship("OrderItem", back_populates="item")
+    price_history = relationship(
+        "PriceHistory", back_populates="item", cascade="all, delete-orphan"
     )
 
 
@@ -718,12 +1522,15 @@ class PriceHistory(Base):
     __tablename__ = "price_history"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    item_id = Column(String(50))
+    item_id = Column(String(50), ForeignKey("items.item_id"), index=True)
     price = Column(Float(precision=2))
     discount_percentage = Column(Float(precision=2))
     competitor_rank = Column(Integer, nullable=True)
     price_position = Column(String(20), nullable=True)
-    recorded_at = Column(DateTime, server_default=text("CURRENT_TIMESTAMP"))
+    recorded_at = Column(DateTime, server_default=text("CURRENT_TIMESTAMP"), index=True)
+
+    # Relationship back to the Item
+    item = relationship("Item", back_populates="price_history")
 
 
 class Seller(Base):
@@ -736,6 +1543,10 @@ class Seller(Base):
     is_competitor = Column(Boolean, default=False)
     market_share_pct = Column(Float(precision=2), nullable=True)
 
+    # Relationships to see all items and orders from a seller
+    items = relationship("Item", back_populates="seller")
+    orders = relationship("Order", back_populates="seller")
+
 
 class MarketTrend(Base):
     __tablename__ = "market_trends"
@@ -743,14 +1554,289 @@ class MarketTrend(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     keyword = Column(String(200))
     search_volume = Column(Integer)
-    category_id = Column(String(50))
+    category_id = Column(String(50), index=True)
     trend_date = Column(Date)
     growth_rate = Column(Float(precision=2))
+
+
+# --- New Models for Orders and Buyers ---
+
+
+class Buyer(Base):
+    """Dimension table for customer/buyer information."""
+
+    __tablename__ = "buyers"
+
+    buyer_id = Column(Integer, primary_key=True)
+    nickname = Column(String(100), nullable=True)
+
+    # Relationship to see all orders from a buyer
+    orders = relationship("Order", back_populates="buyer")
+
+
+class Order(Base):
+    """Fact table for order headers, linking buyers and sellers."""
+
+    __tablename__ = "orders"
+
+    order_id = Column(Integer, primary_key=True)
+    status = Column(String(50), index=True)
+    total_amount = Column(Float(precision=2))
+    total_fees = Column(Float(precision=2))
+    profit_margin = Column(Float(precision=2))
+    currency_id = Column(String(10))
+    date_created = Column(DateTime(timezone=True), index=True)
+    date_closed = Column(DateTime(timezone=True))
+
+    # Foreign Keys to link to dimension tables
+    seller_id = Column(Integer, ForeignKey("sellers.seller_id"), index=True)
+    buyer_id = Column(Integer, ForeignKey("buyers.buyer_id"), index=True)
+
+    # SQLAlchemy Relationships
+    seller = relationship("Seller", back_populates="orders")
+    buyer = relationship("Buyer", back_populates="orders")
+    items = relationship(
+        "OrderItem", back_populates="order", cascade="all, delete-orphan"
+    )
+
+
+class OrderItem(Base):
+    """Fact table for order line items, linking orders to specific products."""
+
+    __tablename__ = "order_items"
+
+    order_item_id = Column(Integer, primary_key=True, autoincrement=True)
+    quantity = Column(Integer)
+    unit_price = Column(Float(precision=2))  # Price at the time of sale
+    sale_fee = Column(Float(precision=2))
+    listing_type = Column(String(50))
+    variation_id = Column(Integer)  # For tracking specific variations (color/size)
+
+    # Foreign Keys to link facts and dimensions
+    order_id = Column(Integer, ForeignKey("orders.order_id"), index=True)
+    item_id = Column(String(50), ForeignKey("items.item_id"), index=True)
+
+    # SQLAlchemy Relationships
+    order = relationship("Order", back_populates="items")
+    item = relationship("Item", back_populates="order_items")
 
 
 def create_all_tables(engine):
     """Create all tables in the target database."""
     Base.metadata.create_all(engine)
+
+# --- .\src\transformers\order_enricher.py
+#!/usr/bin/env python3
+# src/transformers/order_enricher.py
+"""Applies enrichment logic to order transaction data."""
+from datetime import datetime, timezone
+from typing import List, Dict, Optional, Any
+import pytz
+
+
+def _parse_ml_datetime(date_str: Optional[str]) -> Optional[datetime]:
+    """Parse MercadoLibre datetime string to UTC datetime."""
+    if not date_str:
+        return None
+
+    try:
+        # Handle timezone-aware datetime strings
+        dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        return dt.astimezone(timezone.utc)
+    except (ValueError, AttributeError):
+        return None
+
+
+def _normalize_to_sao_paulo(dt: Optional[datetime]) -> Optional[datetime]:
+    """Convert datetime to São Paulo timezone."""
+    if not dt:
+        return None
+
+    sao_paulo_tz = pytz.timezone("America/Sao_Paulo")
+    return dt.astimezone(sao_paulo_tz)
+
+
+def _calculate_profit_margin(total_amount: float, fees: float) -> float:
+    """Calculate profit margin percentage after fees."""
+    if not total_amount or total_amount <= 0:
+        return 0.0
+
+    net_revenue = total_amount - fees
+    return round((net_revenue / total_amount) * 100, 2)
+
+
+def _extract_order_items(order_items: List[Dict]) -> List[Dict]:
+    """Extract and normalize order items."""
+    if not order_items:
+        return []
+
+    items = []
+    for item_data in order_items:
+        item = item_data.get("item", {})
+
+        # Extract variation attributes
+        variations = {}
+        for attr in item.get("variation_attributes", []):
+            variations[attr.get("name", "").lower()] = attr.get("value_name")
+
+        items.append(
+            {
+                "item_id": item.get("id"),
+                "title": item.get("title"),
+                "category_id": item.get("category_id"),
+                "variation_id": item.get("variation_id"),
+                "condition": item.get("condition"),
+                "quantity": item_data.get("quantity", 0),
+                "unit_price": float(item_data.get("unit_price", 0)),
+                "full_unit_price": float(item_data.get("full_unit_price", 0)),
+                "sale_fee": float(item_data.get("sale_fee", 0)),
+                "listing_type": item_data.get("listing_type_id"),
+                "color": variations.get("cor"),
+                "size": variations.get("tamanho"),
+                "seller_sku": item.get("seller_sku"),
+            }
+        )
+
+    return items
+
+
+def _extract_payment_info(payments: List[Dict]) -> Dict[str, Any]:
+    """Extract and aggregate payment information."""
+    if not payments:
+        return {
+            "total_paid": 0.0,
+            "payment_method": None,
+            "installments": 0,
+            "payment_status": None,
+            "date_approved": None,
+        }
+
+    # For simplicity, take the first payment (most orders have single payment)
+    payment = payments[0]
+
+    return {
+        "total_paid": float(payment.get("total_paid_amount", 0)),
+        "payment_method": payment.get("payment_method_id"),
+        "installments": payment.get("installments", 0),
+        "payment_status": payment.get("status"),
+        "date_approved": _parse_ml_datetime(payment.get("date_approved")),
+        "transaction_amount": float(payment.get("transaction_amount", 0)),
+        "taxes_amount": float(payment.get("taxes_amount", 0)),
+    }
+
+
+def enrich_order(order: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Enrich a single order with computed fields and standardized format.
+
+    Args:
+        order: Raw order dictionary from API
+
+    Returns:
+        Enriched order dictionary
+    """
+    if not order:
+        return {}
+
+    # Extract basic order info
+    order_id = order.get("id")
+    total_amount = float(order.get("total_amount", 0))
+
+    # Extract timestamps
+    date_created = _parse_ml_datetime(order.get("date_created"))
+    date_closed = _parse_ml_datetime(order.get("date_closed"))
+    last_updated = _parse_ml_datetime(order.get("last_updated"))
+
+    # Extract participants
+    buyer = order.get("buyer", {})
+    seller = order.get("seller", {})
+
+    # Extract payment info
+    payment_info = _extract_payment_info(order.get("payments", []))
+
+    # Extract order items
+    items = _extract_order_items(order.get("order_items", []))
+
+    # Calculate business metrics
+    total_fees = sum(item.get("sale_fee", 0) for item in items)
+    profit_margin = _calculate_profit_margin(total_amount, total_fees)
+    avg_item_price = total_amount / len(items) if items else 0.0
+    total_quantity = sum(item.get("quantity", 0) for item in items)
+
+    # Processing timestamp
+    processed_at = datetime.now(timezone.utc)
+
+    return {
+        # Order identification
+        "order_id": order_id,
+        "pack_id": order.get("pack_id"),
+        "status": order.get("status"),
+        "status_detail": order.get("status_detail"),
+        # Financial data
+        "total_amount": total_amount,
+        "paid_amount": float(order.get("paid_amount", 0)),
+        "currency_id": order.get("currency_id"),
+        "total_fees": total_fees,
+        "profit_margin": profit_margin,
+        # Payment information
+        "payment_method": payment_info["payment_method"],
+        "installments": payment_info["installments"],
+        "payment_status": payment_info["payment_status"],
+        "date_payment_approved": payment_info["date_approved"],
+        # Participants
+        "buyer_id": buyer.get("id"),
+        "buyer_nickname": buyer.get("nickname"),
+        "seller_id": seller.get("id"),
+        "seller_nickname": seller.get("nickname"),
+        # Timestamps (normalized to São Paulo)
+        "date_created": _normalize_to_sao_paulo(date_created),
+        "date_closed": _normalize_to_sao_paulo(date_closed),
+        "last_updated": _normalize_to_sao_paulo(last_updated),
+        "processed_at": processed_at,
+        # Order metrics
+        "total_items": len(items),
+        "total_quantity": total_quantity,
+        "avg_item_price": round(avg_item_price, 2),
+        # Shipping
+        "shipping_id": order.get("shipping", {}).get("id"),
+        "shipping_cost": order.get("shipping_cost"),
+        # Additional metadata
+        "tags": order.get("tags", []),
+        "context_channel": order.get("context", {}).get("channel"),
+        "context_site": order.get("context", {}).get("site"),
+        # Order items (normalized)
+        "items": items,
+    }
+
+
+def enrich_orders(raw_orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Enrich a list of orders with computed fields and standardized format.
+
+    Args:
+        raw_orders: List of raw order dictionaries from API
+
+    Returns:
+        List of enriched order dictionaries
+    """
+    if not raw_orders:
+        return []
+
+    return [enrich_order(order) for order in raw_orders if order]
+
+
+def enrich_orders_from_json(json_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Enrich orders from JSON file format (with 'orders' key).
+
+    Args:
+        json_data: Dictionary with 'orders' key containing list of orders
+
+    Returns:
+        List of enriched order dictionaries
+    """
+    orders = json_data.get("orders", [])
+    return enrich_orders(orders)
 
 # --- .\src\transformers\product_enricher.py
 # src/transformers/product_enricher.py
@@ -800,6 +1886,7 @@ def enrich_item(item: Dict[str, Any]) -> Dict[str, Any]:
         return {}
 
     attrs = item.get("attributes", [])
+    seller_info = item.get("seller", {})  # Extract the full seller object
 
     # Extract attributes - note the correct attribute key for color
     brand = _get_attr(attrs, "BRAND")
@@ -834,6 +1921,8 @@ def enrich_item(item: Dict[str, Any]) -> Dict[str, Any]:
         "views": views,
         "conversion_rate": conversion,
         "seller_id": item.get("seller_id"),
+        # Add seller_nickname for relational Seller table
+        "seller_nickname": seller_info.get("nickname"),
         "created_at": timestamp,
         "updated_at": timestamp,
         "discount_percentage": discount_pct,

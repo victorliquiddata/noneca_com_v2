@@ -4,6 +4,8 @@
 import os
 import json
 import requests
+import typing
+from typing import Dict, Any, Optional
 import secrets
 from datetime import datetime, timedelta
 from config.config import cfg
@@ -161,10 +163,42 @@ class MLClient:
         except Exception as e:
             return {"questions": [], "total": 0, "error": str(e)}
 
-    def get_orders(self, token, seller_id, limit=50):
+    def get_orders(
+        self,
+        token: str,
+        seller_id: str,
+        *,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        sort: str = "date_created",
+        limit: int = 100,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        """
+        Hits /orders/search with full filter/sort/pagination support.
+        Returns the raw JSON (including `results`, `paging`, etc.) for callers to
+        page through as needed.
+        """
+        # Ensure we have a valid bearer token on the session
         self._auth(token)
-        params = {"seller": seller_id, "limit": limit}
-        return self._req("GET", "/orders/search", params=params)["results"]
+
+        # Build query parameters
+        params: Dict[str, Any] = {
+            "seller": seller_id,
+            "limit": limit,
+            "offset": offset,
+            "sort": "date_asc" if sort == "date_created" else sort,
+        }
+        if date_from:
+            params["order.date_created.from"] = date_from
+        if date_to:
+            params["order.date_created.to"] = date_to
+
+        # Delegate to the shared request method
+        response = self._req("GET", "/orders/search", params=params)
+
+        # response is expected to include both "results" and "paging"
+        return response
 
     def get_listing_types(self, token, site_id):
         self._auth(token)

@@ -41,10 +41,7 @@ class MLClient:
 **Database Implementation**:
 ```sql
 -- Core tables established
-- items (product catalog with enriched attributes)
-- price_history (automated price tracking)
-- sellers (competitor analysis and reputation)
-- categories (hierarchical product classification)
+{{insert_updated_core_tables}}
 ```
 
 ---
@@ -82,9 +79,9 @@ class MLClient:
 ## Phase 3: Database Architecture Enhancement (Completed ✅)
 
 ### Enhanced Schema Development
-**Status**: Completed ✅
+**Status**: to be implemented
 
-**Major Schema Additions**:
+**Major Schema Additions To be Implemented**:
 ```sql
 -- Orders table for transaction intelligence
 CREATE TABLE orders (
@@ -166,7 +163,7 @@ def normalize_to_sao_paulo(self, timestamp):
 
 ### Technical Excellence Achieved
 1. **Pagination Strategy**: Essential for large dataset processing without memory issues
-2. **Timezone Handling**: Critical for accurate Brazilian marketplace analysis  
+2. **Timezone Handling**: Critical for accurate Brazilian marketplace analysis --> to be implemented 
 3. **Error Handling**: Comprehensive validation prevents data corruption
 4. **Test Coverage**: 84/84 tests provide production-ready confidence
 5. **Modular Design**: Separation of concerns enables maintainable codebase

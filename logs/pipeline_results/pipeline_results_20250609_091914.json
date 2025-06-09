@@ -1,0 +1,30 @@
+{
+  "start_time": "2025-06-09T09:17:41.568827",
+  "end_time": "2025-06-09T09:19:14.591124",
+  "duration": 93.022297,
+  "results": {
+    "354140329": {
+      "items": {
+        "success": true,
+        "records_processed": 76,
+        "error": null
+      },
+      "orders": {
+        "success": true,
+        "records_processed": 271,
+        "error": null
+      }
+    }
+  },
+  "errors": [],
+  "warnings": [],
+  "summary": {
+    "duration": 93.022297,
+    "total_sellers": 1,
+    "items_successful": 1,
+    "orders_successful": 1,
+    "fully_successful": 1,
+    "total_errors": 0,
+    "total_warnings": 0
+  }
+}

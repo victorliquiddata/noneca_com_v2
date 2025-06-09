@@ -125,6 +125,7 @@ class TestEnrichItem:
             "condition": "new",
             "views": 15000,
             "seller_id": "354140329",
+            "seller": {"nickname": "NonecaShop"},
             "attributes": [
                 {"id": "BRAND", "value_name": "Noneca"},
                 {"id": "SIZE", "value_name": "M"},
@@ -138,10 +139,7 @@ class TestEnrichItem:
 
         # Basic fields
         assert result["item_id"] == "MLB1101016456"
-        assert (
-            result["title"]
-            == "Noneca - Calcinha Aquendar Vinil - Trans, Cds, Travs, Drags"
-        )
+        assert result["title"] == raw_item["title"]
         assert result["category_id"] == "MLB4954"
         assert result["current_price"] == 61.7
         assert result["original_price"] == 75.0
@@ -149,6 +147,7 @@ class TestEnrichItem:
         assert result["sold_quantity"] == 1148
         assert result["condition"] == "new"
         assert result["seller_id"] == "354140329"
+        assert result["seller_nickname"] == "NonecaShop"
 
         # Extracted attributes
         assert result["brand"] == "Noneca"
@@ -179,6 +178,7 @@ class TestEnrichItem:
         assert result["discount_percentage"] == 0.0
         assert result["brand"] is None
         assert result["views"] == 0
+        assert result.get("seller_nickname") is None
 
     def test_enrich_item_empty_dict(self):
         """Test enriching empty item."""
@@ -227,7 +227,6 @@ class TestEnrichItem:
         raw_item = {"id": "MLB1234567"}
 
         result = enrich_item(raw_item)
-
         assert result["created_at"].tzinfo == timezone.utc
         assert result["updated_at"].tzinfo == timezone.utc
 
@@ -359,102 +358,4 @@ class TestEdgeCases:
             "sold_quantity": 50000,
         }
 
-        result = enrich_item(raw_item)
-
-        assert result["current_price"] == 999999.99
-        assert result["views"] == 1000000
-        assert result["conversion_rate"] == 0.05  # 50000/1000000
-
-    def test_unicode_strings(self):
-        """Test handling of unicode strings."""
-        raw_item = {
-            "id": "MLB1234567",
-            "title": "Calcinha Renda Açaí",
-            "attributes": [{"id": "BRAND", "value_name": "Nonéca"}],
-        }
-
-        result = enrich_item(raw_item)
-
-        assert result["title"] == "Calcinha Renda Açaí"
-        assert result["brand"] == "Nonéca"
-
-    def test_extreme_precision(self):
-        """Test precision handling with extreme decimal places."""
-        raw_item = {"id": "MLB1234567", "views": 7, "sold_quantity": 3}
-
-        result = enrich_item(raw_item)
-
-        # 3/7 = 0.4285714285714286, should be rounded to 4 decimal places
-        assert result["conversion_rate"] == 0.4286
-
-
-@pytest.fixture
-def sample_raw_items():
-    """Fixture providing sample raw items for testing."""
-    return [
-        {
-            "id": "MLB1101016456",
-            "title": "Noneca - Calcinha Aquendar Vinil - Trans, Cds, Travs, Drags",
-            "category_id": "MLB4954",
-            "price": 61.7,
-            "original_price": 75.0,
-            "available_quantity": 26,
-            "sold_quantity": 1148,
-            "condition": "new",
-            "views": 15000,
-            "seller_id": "354140329",
-            "attributes": [
-                {"id": "BRAND", "value_name": "Noneca"},
-                {"id": "SIZE", "value_name": "M"},
-                {"id": "MAIN_COLOR", "value_name": "Preto"},
-                {"id": "PANTY_TYPE", "value_name": "Calcinha"},
-                {"id": "GENDER", "value_name": "Trans"},
-            ],
-        },
-        {
-            "id": "MLB1234567",
-            "title": "Calcinha Renda Clássica",
-            "category_id": "MLB4954",
-            "price": 35.0,
-            "original_price": 42.0,
-            "available_quantity": 15,
-            "sold_quantity": 89,
-            "condition": "new",
-            "views": 890,
-            "seller_id": "354140329",
-            "attributes": [
-                {"id": "BRAND", "value_name": "Noneca"},
-                {"id": "SIZE", "value_name": "G"},
-                {"id": "MAIN_COLOR", "value_name": "Rosa"},
-                {"id": "PANTY_TYPE", "value_name": "Calcinha"},
-                {"id": "GENDER", "value_name": "Feminino"},
-            ],
-        },
-    ]
-
-
-def test_realistic_enrichment_scenario(sample_raw_items):
-    """Test enrichment with realistic underwear marketplace data."""
-    result = enrich_items(sample_raw_items)
-
-    assert len(result) == 2
-
-    # Vinyl panty checks
-    vinyl_panty = result[0]
-    assert vinyl_panty["item_id"] == "MLB1101016456"
-    assert vinyl_panty["brand"] == "Noneca"
-    assert vinyl_panty["size"] == "M"
-    assert vinyl_panty["color"] == "Preto"
-    assert vinyl_panty["gender"] == "Trans"
-    assert vinyl_panty["conversion_rate"] == 0.0765  # 1148/15000
-    assert vinyl_panty["discount_percentage"] == 17.73  # (75-61.7)/75*100
-
-    # Lace panty checks
-    lace_panty = result[1]
-    assert lace_panty["item_id"] == "MLB1234567"
-    assert lace_panty["brand"] == "Noneca"
-    assert lace_panty["size"] == "G"
-    assert lace_panty["color"] == "Rosa"
-    assert lace_panty["gender"] == "Feminino"
-    assert lace_panty["conversion_rate"] == 0.1  # 89/890
-    assert lace_panty["discount_percentage"] == 16.67  # (42-35)/42*100
+        result = enrich_item

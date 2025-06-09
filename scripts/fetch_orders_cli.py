@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# scripts/fetch_orders_cli.py
+# fetch_orders_cli.py
 """
 Interactive CLI to fetch orders from MercadoLibre seller via pagination
 and save results to uniquely named JSON files under separate fetch-type folders.
